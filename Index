@@ -1,0 +1,287 @@
+<!DOCTYPE html>
+<html lang="zh-TW">
+<head>
+  <base target="_top">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>德州撲克帳本</title>
+  <style>
+    * { box-sizing:border-box; }
+    body { margin:0; background:#f2f5f9; color:#19263b; font:15px system-ui,'Microsoft JhengHei',sans-serif; }
+    header { background:#172b46; color:white; padding:17px 22px; display:flex; justify-content:space-between; align-items:center; gap:10px; }
+    header h2 { margin:0; font-size:21px; }
+    .wrap { max-width:1180px; margin:auto; padding:18px; }
+    .panel { background:white; padding:18px; margin-bottom:14px; border-radius:12px; box-shadow:0 2px 12px #1f35431a; }
+    .row { display:flex; justify-content:space-between; align-items:center; gap:12px; flex-wrap:wrap; }
+    .toolbar { display:flex; flex-wrap:wrap; gap:8px; margin:12px 0; }
+    .toolbar.end { margin-left:auto; } .cashout-btn { margin-left:auto; }
+    h3 { margin:0 0 10px; } h4 { margin:8px 0; }
+    button { border:0; border-radius:8px; background:#1f4a79; padding:10px 13px; color:white; font-size:14px; cursor:pointer; }
+    button:hover { filter:brightness(1.08); } button:disabled { opacity:.5; cursor:wait; }
+    .muted { color:#61718a; font-size:13px; } .danger { background:#b83a46; } .secondary { background:#e5ebf4; color:#1f3857; }
+    .hidden { display:none!important; } .scroll { overflow:auto; max-height:360px; }
+    table { border-collapse:collapse; width:100%; white-space:nowrap; font-size:14px; }
+    th,td { padding:10px; text-align:left; border-bottom:1px solid #e5e9f0; }
+    th { background:#edf2f7; position:sticky; top:0; } tr[data-id] { cursor:pointer; }
+    tr.selected { background:#d8eaff; } tr[data-id]:hover { background:#eaf4ff; }
+    .positive { color:#138454; font-weight:600; } .negative { color:#c13748; font-weight:600; }
+    .footer { position:sticky; bottom:0; z-index:4; padding:12px; display:flex; align-items:center; justify-content:flex-end; gap:8px; background:white; border-top:1px solid #dae2e9; box-shadow:0 -4px 12px #0001; }
+    .note { color:#c43748; min-height:22px; } input,select { padding:10px; border:1px solid #b7c5d3; border-radius:8px; font:inherit; max-width:100%; }
+    label { display:block; margin:12px 0 4px; font-weight:600; }
+    dialog { border:0; border-radius:14px; padding:20px; box-shadow:0 12px 70px #0005; width:min(95vw,560px); max-height:90vh; overflow:auto; }
+    dialog::backdrop { background:#17243b99; } dialog input { width:100%; }
+    .fieldrow { display:grid; grid-template-columns:1fr 1fr; gap:12px; } .inline { display:flex; gap:8px; align-items:center; flex-wrap:wrap; }
+    .pill { background:#e0ebf5; padding:5px 9px; border-radius:20px; color:#26476c; font-size:12px; }
+    .water-totals { display:flex; flex-wrap:wrap; gap:12px; margin-top:12px; }
+    .water-totals span { background:#edf2f7; padding:9px 12px; border-radius:8px; }
+    @media(max-width:600px) { .wrap { padding:8px; } .panel { padding:12px; } header h2 { font-size:17px; } button { padding:9px; font-size:13px; } .fieldrow { grid-template-columns:1fr; } }
+  </style>
+</head>
+<body>
+  <header><h2>♠ 德州撲克帳務管理</h2><span id="roleLabel" class="pill">未登入</span></header>
+  <main class="wrap">
+    <section id="loginPage" class="panel">
+      <h3>登入帳本</h3>
+      <div class="inline"><input id="password" type="password" placeholder="請輸入場次六位碼"><button id="loginButton" onclick="signIn()">登入</button></div>
+    </section>
+    <div id="app" class="hidden">
+      <section id="home" class="panel">
+        <div class="row"><h3>場次管理</h3><button class="secondary" onclick="reload()">重新整理</button></div>
+        <div class="toolbar admin"><button onclick="editSession(false)">新增場次</button><button onclick="editSession(true)">修改場次</button><button class="danger" onclick="deleteSession()">刪除場次</button><button onclick="importClick()">匯入 JSON</button><button class="secondary" onclick="exportBackup()">匯出備份</button></div>
+        <div class="toolbar"><button class="secondary non-player" onclick="openLogs()">詳細資料 Log</button><button onclick="openSession()">開啟選取場次</button></div>
+        <input id="importFile" type="file" accept="application/json,.json" class="hidden" onchange="importFile(event)">
+        <div class="scroll"><table><thead><tr><th>日期</th><th>開始時間</th><th class="non-player">備註</th><th class="non-player">狀態</th><th>玩家數</th><th class="non-player">保險累計</th></tr></thead><tbody id="sessionsBody"></tbody></table></div>
+        <p class="muted">點選一列後操作，也可以雙擊直接開啟。</p>
+      </section>
+      <section id="detail" class="hidden">
+        <div class="panel"><div class="row"><h3 id="sessionTitle">場次詳細管理</h3><button class="secondary" onclick="goHome()">返回場次管理</button></div><p id="playerAccess" class="muted admin hidden"></p></div>
+        <div id="mainArea">
+          <div class="panel">
+            <div class="row"><h3>玩家</h3><div class="toolbar admin"><button onclick="addPlayer()">新增玩家</button><button onclick="editPlayer()">編輯玩家</button><button class="danger" onclick="deletePlayer()">刪除玩家</button><button onclick="rebuy()">快速補碼</button><button class="danger cashout-btn" onclick="cashout()">結碼</button></div></div>
+            <div class="scroll"><table><thead><tr><th>玩家姓名</th><th>累計買入</th><th>結碼量</th><th class="non-player">盈虧</th><th class="non-player">狀態</th></tr></thead><tbody id="playersBody"></tbody></table></div>
+          </div>
+          <div class="panel non-player">
+            <div class="row"><h3>保險</h3><div class="toolbar admin"><button onclick="editInsurance(false)">新增保險</button><button onclick="editInsurance(true)">編輯保險</button><button class="danger" onclick="deleteInsurance()">刪除保險</button></div></div>
+            <div class="scroll"><table><thead><tr><th>時間</th><th>保險</th><th>保險累計</th><th>備註</th></tr></thead><tbody id="insuranceBody"></tbody></table></div>
+          </div>
+        </div>
+        <div id="waterArea" class="panel hidden">
+          <div class="row"><h3>水錢（管理員專用）</h3><div class="toolbar admin"><button onclick="addPartner()">新增合夥人</button><button onclick="editWater(false)">新增水錢</button><button onclick="editWater(true)">編輯水錢</button></div></div>
+          <p id="partnerNames" class="muted"></p>
+          <div class="scroll"><table><thead id="waterHead"></thead><tbody id="waterBody"></tbody></table></div>
+          <div id="waterTotals" class="water-totals"></div>
+        </div>
+        <div class="footer"><button id="waterToggle" class="secondary hidden" onclick="toggleWater()">水</button><button id="endButton" class="danger admin" onclick="endSession()">結束場次</button></div>
+      </section>
+      <section id="logsPage" class="panel hidden">
+        <div class="row"><h3>詳細資料 Log</h3><button class="secondary" onclick="goHome()">返回</button></div>
+        <div class="toolbar"><select id="logCategory" onchange="renderLogs()"><option value="全部">全部</option><option>場次</option><option>玩家</option><option>保險</option><option>合夥人</option><option>水錢</option></select><select id="logPlayer" onchange="renderLogs()"><option value="">全部玩家</option></select></div>
+        <div class="scroll" style="max-height:640px"><table><thead><tr><th>實際操作時間</th><th>類別</th><th>動作</th><th>玩家</th><th>詳細內容</th></tr></thead><tbody id="logsBody"></tbody></table></div>
+      </section>
+      <section class="panel row"><span id="message" class="note"></span><button class="secondary" onclick="signOut()">登出</button></section>
+    </div>
+  </main>
+  <dialog id="editor"><form id="editForm" onsubmit="submitForm(event)"><h3 id="editorTitle">編輯</h3><div id="formFields"></div><div class="toolbar" style="justify-content:flex-end"><button type="button" class="secondary" onclick="$('editor').close()">取消</button><button id="submitButton" type="submit">確認</button></div></form></dialog>
+  <script>
+    const $ = id => document.getElementById(id);
+    const esc = value => String(value ?? '').replace(/[&<>"']/g, c => ({ '&':'&amp;', '<':'&lt;', '>':'&gt;', '"':'&quot;', "'":'&#39;' }[c]));
+    const fmt = v => Number(v).toLocaleString('zh-TW');
+    const day = () => { const d=new Date(); return `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')}`; };
+    const clock = () => { const d=new Date(); return `${String(d.getHours()).padStart(2,'0')}:${String(d.getMinutes()).padStart(2,'0')}`; };
+    const rpc = (method,...args) => new Promise((resolve,reject)=>google.script.run.withSuccessHandler(resolve).withFailureHandler(reject)[method](...args));
+    let token='', role='', db={ sessions:[],logs:[] }, sid='', pid='', insuranceId='', rakeId='', water=false, formState=null, busy=false;
+    const admin = () => role === 'admin';
+    const canSeeAll = () => role === 'admin' || role === 'viewer';
+    const current = () => db.sessions.find(x=>x.id===sid);
+    const player = () => current()?.players.find(x=>x.id===pid);
+    const insurance = () => current()?.insurances.find(x=>x.id===insuranceId);
+    const rake = () => current()?.rakes?.find(x=>x.id===rakeId);
+    const done = p => p?.cashout != null && typeof p.cashout==='object' && p.cashout.amount != null;
+    function error(e) { const message=e?.message||String(e); $('message').textContent=message; alert(message); }
+    function renderPermissions() {
+      document.querySelectorAll('.admin').forEach(el=>el.classList.toggle('hidden',!admin()));
+      document.querySelectorAll('.non-player').forEach(el=>el.classList.toggle('hidden',!canSeeAll()));
+      const locked=current()?.status==='ended';
+      document.querySelectorAll('#detail .admin').forEach(el=>el.classList.toggle('hidden',!admin()||locked));
+      $('waterToggle').classList.toggle('hidden',!canSeeAll());
+    }
+    async function signIn() {
+      try {
+        $('loginButton').disabled=true;
+        const response=await rpc('login',$('password').value);
+        token=response.token; role=response.role; $('password').value='';
+        $('roleLabel').textContent=role==='admin'?'管理員':role==='viewer'?'合夥人（唯讀）':'玩家（唯讀）';
+        $('loginPage').classList.add('hidden'); $('app').classList.remove('hidden');
+        await reload();
+      } catch(e) { error(e); } finally { $('loginButton').disabled=false; }
+    }
+    async function signOut() {
+      try { await rpc('logout',token); } catch(e) {}
+      token=''; role=''; db={sessions:[],logs:[]}; sid=''; pid=''; water=false;
+      $('app').classList.add('hidden'); $('loginPage').classList.remove('hidden'); $('roleLabel').textContent='未登入';
+    }
+    async function reload() {
+      try {
+        const response=await rpc('snapshot',token);
+        db=response.data; role=response.role;
+        if (sid && !current()) { sid=''; goHome(); }
+        if (!canSeeAll()) water = false;
+        renderHome();
+        if (!$('detail').classList.contains('hidden')) renderDetail();
+        if (!$('logsPage').classList.contains('hidden')) renderLogs();
+        $('message').textContent='最後更新：'+new Date().toLocaleTimeString('zh-TW');
+        return true;
+      } catch(e) { error(e); return false; }
+    }
+    function renderHome() {
+      const list=[...db.sessions].sort((a,b)=>(b.date+b.start).localeCompare(a.date+a.start));
+      $('sessionsBody').innerHTML=list.map(s=>`<tr data-id="${esc(s.id)}" class="${sid===s.id?'selected':''}"><td>${esc(s.date)}</td><td>${esc(s.start)}</td>${canSeeAll()?`<td>${esc(s.note)}</td><td>${s.status==='ended'?'已結束':'進行中'}</td>`:''}<td>${s.players.length}</td>${canSeeAll()?`<td>${fmt(s.insurances.reduce((n,x)=>n+x.amount,0))}</td>`:''}</tr>`).join('');
+      $('sessionsBody').querySelectorAll('tr').forEach(tr=>{
+        tr.addEventListener('click',()=>{ sid=tr.dataset.id; $('sessionsBody').querySelectorAll('tr').forEach(x=>x.classList.toggle('selected',x===tr)); });
+        tr.addEventListener('dblclick',()=>openSession(tr.dataset.id));
+      });
+      renderPermissions();
+    }
+    function openSession(id) {
+      if (id) sid=id;
+      if (!current()) return alert('請先選擇場次');
+      pid=''; insuranceId=''; rakeId=''; water=false;
+      $('home').classList.add('hidden'); $('logsPage').classList.add('hidden'); $('detail').classList.remove('hidden'); renderDetail();
+    }
+    function goHome() { $('detail').classList.add('hidden'); $('logsPage').classList.add('hidden'); $('home').classList.remove('hidden'); water=false; renderHome(); }
+    function selectRow(tbody,id,setter) {
+      tbody.querySelectorAll('tr').forEach(tr=>tr.addEventListener('click',()=>{
+        setter(tr.dataset.id); tbody.querySelectorAll('tr').forEach(x=>x.classList.toggle('selected',x===tr));
+      }));
+    }
+    function renderDetail() {
+      const s=current(); if (!s) return;
+      $('sessionTitle').textContent=canSeeAll()?`${s.date} ${s.start}｜${s.status==='ended'?'已結束':'進行中'}｜${s.note}`:`${s.date} ${s.start}｜玩家買入／結碼`;
+      $('playerAccess').textContent=admin()?`玩家登入密碼：${s.playerCode || '尚未產生' }（提供給本場玩家使用）`:'';
+      $('playerAccess').classList.toggle('hidden',!admin());
+      $('playersBody').innerHTML=s.players.map(p=>{
+        const buy=p.buyin+p.rebuys.reduce((n,x)=>n+x.amount,0), finished=done(p), profit=finished?p.cashout.amount-buy:null;
+        return `<tr data-id="${esc(p.id)}" class="${pid===p.id?'selected':''}"><td>${esc(p.name)}</td><td>${fmt(buy)}</td><td>${finished?fmt(p.cashout.amount):'—'}</td>${canSeeAll()?`<td class="${profit==null?'':profit>=0?'positive':'negative'}">${profit==null?'—':(profit>0?'+':'')+fmt(profit)}</td><td>${finished?'已結碼／唯讀':'進行中'}</td>`:''}</tr>`;
+      }).join('');
+      selectRow($('playersBody'),'id',v=>pid=v);
+      let running=0;
+      $('insuranceBody').innerHTML=s.insurances.map(x=>{
+        running+=x.amount;
+        return `<tr data-id="${esc(x.id)}" class="${insuranceId===x.id?'selected':''}"><td>${esc(x.time)}</td><td>${fmt(x.amount)}</td><td>${fmt(running)}</td><td>${esc(x.note)}</td></tr>`;
+      }).join('');
+      selectRow($('insuranceBody'),'id',v=>insuranceId=v);
+      if (canSeeAll()) renderWater();
+      $('mainArea').classList.toggle('hidden',water); $('waterArea').classList.toggle('hidden',!water);
+      $('waterToggle').textContent=water?'隱藏水':'水'; renderPermissions();
+    }
+    function renderWater() {
+      const s=current(); if (!s || !canSeeAll()) return;
+      const partners=s.partners||[], rakes=s.rakes||[];
+      $('partnerNames').textContent='合夥人：'+(partners.map(x=>x.name).join('、')||'尚未新增');
+      $('waterHead').innerHTML='<tr><th>時間</th><th>水錢</th>'+partners.map(x=>`<th>${esc(x.name)} 分水</th>`).join('')+'<th>備註</th></tr>';
+      $('waterBody').innerHTML=rakes.map(r=>`<tr data-id="${esc(r.id)}" class="${rakeId===r.id?'selected':''}"><td>${esc(r.time)}</td><td>${fmt(r.amount)}</td>${partners.map(p=>`<td>${fmt((r.splits||[]).find(x=>x.partnerId===p.id)?.amount||0)}</td>`).join('')}<td>${esc(r.note)}</td></tr>`).join('');
+      selectRow($('waterBody'),'id',v=>rakeId=v);
+      $('waterTotals').innerHTML=`<span><strong>總水：${fmt(rakes.reduce((n,x)=>n+x.amount,0))}</strong></span>`+partners.map(p=>`<span>${esc(p.name)}：${fmt(rakes.reduce((n,r)=>n+((r.splits||[]).find(x=>x.partnerId===p.id)?.amount||0),0))}</span>`).join('');
+    }
+    function toggleWater() { if (!canSeeAll()) return; water=!water; renderDetail(); }
+    function openLogs() {
+      if (!canSeeAll()) return;
+      if (!current()) return alert('請先選擇場次');
+      $('home').classList.add('hidden'); $('detail').classList.add('hidden'); $('logsPage').classList.remove('hidden');
+      const people=new Map(db.logs.filter(x=>x.sid===sid && x.pid).map(x=>[x.pid,x.pname]));
+      $('logPlayer').innerHTML='<option value="">全部玩家</option>'+[...people].map(([id,name])=>`<option value="${esc(id)}">${esc(name)}</option>`).join('');
+      $('logCategory').innerHTML=['全部','場次','玩家','保險',...['合夥人','水錢']].map(x=>`<option>${x}</option>`).join('');
+      renderLogs();
+    }
+    function renderLogs() {
+      const category=$('logCategory').value, who=$('logPlayer').value;
+      $('logsBody').innerHTML=db.logs.filter(x=>x.sid===sid&&(category==='全部'||x.category===category)&&(!who||x.pid===who)).map(x=>`<tr><td>${esc(x.at)}</td><td>${esc(x.category)}</td><td>${esc(x.action)}</td><td>${esc(x.pname)}</td><td style="white-space:normal">${esc(x.detail)}</td></tr>`).join('');
+    }
+    function openForm(title,op,fields,args={}) {
+      formState={op,args}; $('editorTitle').textContent=title;
+      $('formFields').innerHTML='';
+      for (const f of fields) {
+        const label=document.createElement('label'); label.textContent=f.label;
+        const el=document.createElement('input'); el.name=f.key; el.type=f.type||'text'; el.value=String(f.value??''); el.required=f.required!==false;
+        if (el.type==='number') { el.step=f.step||'1'; if (f.min!==undefined) el.min=f.min; }
+        $('formFields').append(label,el);
+      }
+      $('editor').showModal();
+    }
+    async function submitForm(event) {
+      event.preventDefault(); if (busy||!formState) return;
+      const payload={...formState.args};
+      $('formFields').querySelectorAll('input').forEach(input=>payload[input.name]=input.value);
+      if (formState.op==='addRake'||formState.op==='editRake') {
+        payload.ratios=current().partners.map(p=>({ partnerId:p.id, ratio:payload['ratio_'+p.id] }));
+        Object.keys(payload).filter(k=>k.startsWith('ratio_')).forEach(k=>delete payload[k]);
+      }
+      busy=true; $('submitButton').disabled=true;
+      try { if (await runAction(formState.op,payload)) { $('editor').close(); formState=null; } }
+      finally { busy=false; $('submitButton').disabled=false; }
+    }
+    async function runAction(op,args) {
+      if (!admin()) return false;
+      try {
+        const result = await rpc('mutate',token,op,args);
+        if (op==='addSession') alert(`場次建立成功！\n\n玩家登入密碼：${result.playerCode}\n\n請將這組六位數密碼提供給本場玩家。`);
+        if (op==='endSession'||op==='deleteSession') goHome();
+        if (op==='deleteSession') sid='';
+        return await reload();
+      } catch(e) { error(e); return false; }
+    }
+    function field(key,label,value='',type='text',extra={}) { return { key,label,value,type,...extra }; }
+    function editSession(edit) {
+      const s=edit?current():null;
+      if (edit&&!s) return alert('請先選擇場次');
+      openForm(edit?'修改場次':'新增場次',edit?'editSession':'addSession',[
+        field('date','場次日期',s?.date||day(),'date'),field('start','開始時間',s?.start||clock(),'time'),field('note','備註',s?.note||'','text',{required:false})
+      ],edit?{sid}:{});
+    }
+    function deleteSession() { if (!current()) return alert('請先選擇場次'); if(confirm('刪除整個場次及其全部紀錄？此操作無法復原！')) runAction('deleteSession',{sid}); }
+    function activePlayer() {
+      const p=player(); if (!p) { alert('請先選取玩家'); return null; }
+      if (done(p)) { alert('此玩家已結碼，唯讀'); return null; }
+      return p;
+    }
+    function addPlayer() { openForm('新增玩家','addPlayer',[field('name','玩家姓名'),field('buyin','初始買入','0','number',{min:'0'}),field('note','備註','','text',{required:false})],{sid}); }
+    function editPlayer() { const p=activePlayer(); if(p) openForm('編輯玩家','editPlayer',[field('name','玩家姓名',p.name)],{sid,pid:p.id}); }
+    function deletePlayer() { const p=activePlayer(); if(p&&confirm('確定刪除 '+p.name+'？')) runAction('deletePlayer',{sid,pid:p.id}); }
+    function rebuy() { const p=activePlayer(); if(p) openForm('快速補碼：'+p.name,'rebuy',[field('amount','重新買入金額','','number',{min:'1'}),field('note','備註','','text',{required:false})],{sid,pid:p.id}); }
+    function cashout() { const p=activePlayer(); if(p&&confirm('此玩家結碼後將永久鎖定。要繼續嗎？')) openForm('結碼：'+p.name,'cashout',[field('amount','玩家剩餘碼量','','number',{min:'0'}),field('note','備註','','text',{required:false})],{sid,pid:p.id}); }
+    function editInsurance(edit) {
+      const i=edit?insurance():null; if(edit&&!i) return alert('請先選擇保險紀錄');
+      openForm(edit?'編輯保險':'新增保險',edit?'editInsurance':'addInsurance',[
+        field('time','時間',i?.time||clock(),'time'),field('amount','保險金額（可負數）',i?.amount??'','number'),field('note','備註',i?.note||'','text',{required:false})
+      ],edit?{sid,itemId:i.id}:{sid});
+    }
+    function deleteInsurance() { const i=insurance(); if(!i) return alert('請先選擇保險紀錄'); if(confirm(`刪除 ${i.time} 的保險 ${i.amount}？`)) runAction('deleteInsurance',{sid,itemId:i.id}); }
+    function addPartner() { openForm('新增合夥人','addPartner',[field('name','合夥人姓名')],{sid}); }
+    function editWater(edit) {
+      const s=current(), r=edit?rake():null;
+      if(edit&&!r) return alert('請先選擇水錢紀錄');
+      if(!s.partners.length) return alert('請先新增合夥人');
+      const fields=[field('time','時間',r?.time||clock(),'time'),field('amount','水錢',r?.amount??'','number',{min:'0'})];
+      s.partners.forEach(p=>fields.push(field('ratio_'+p.id,p.name+' 分水比例（%）',r?.splits?.find(x=>x.partnerId===p.id)?.ratio??'0','number',{step:'0.01',min:'0'})));
+      fields.push(field('note','備註',r?.note||'','text',{required:false}));
+      openForm(edit?'編輯水錢':'新增水錢',edit?'editRake':'addRake',fields,edit?{sid,itemId:r.id}:{sid});
+    }
+    function endSession() { if(confirm('確定結束場次？所有內容將鎖定、變成唯讀。')) runAction('endSession',{sid}); }
+    function importClick() { $('importFile').click(); }
+    async function importFile(event) {
+      const file=event.target.files[0]; if(!file) return;
+      try {
+        if(!confirm('匯入會新增場次，不覆蓋原紀錄。請確認已備份原帳本，繼續嗎？')) return;
+        const text=await file.text(); const result=await rpc('importJson',token,text);
+        alert('成功匯入 '+result.imported+' 場'); await reload();
+      } catch(e) { error(e); } finally { event.target.value=''; }
+    }
+    async function exportBackup() {
+      try {
+        const text=await rpc('backup',token), blob=new Blob([text],{type:'application/json;charset=utf-8'});
+        const url=URL.createObjectURL(blob), a=document.createElement('a');
+        a.href=url; a.download='poker_v6_backup_'+day()+'.json'; a.click(); URL.revokeObjectURL(url);
+      } catch(e) { error(e); }
+    }
+  </script>
+</body>
+</html>

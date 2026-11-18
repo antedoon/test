@@ -1,0 +1,403 @@
+/** Poker Ledger v8 - 場次專屬六位數玩家密碼、三種角色資料隔離與分段儲存。沿用既有 v6 資料庫。 */
+const CFG = { sheet: 'PokerV6', key: 'POKER_V6_SHEET_ID', sessionSeconds: 21600 };
+
+// 升級既有帳本時不要再次執行 setup()；管理員與合夥人原密碼保持不變，玩家改用每場自動產生的六位數密碼。
+function setup() {
+  const ADMIN_PASSWORD = 'CHANGE_TO_NEW_ADMIN_PASSWORD';
+  const VIEW_PASSWORD = 'CHANGE_TO_NEW_VIEW_PASSWORD';
+  if (ADMIN_PASSWORD.startsWith('CHANGE_') || VIEW_PASSWORD.startsWith('CHANGE_')) throw Error('請先設定兩組新密碼');
+  if (ADMIN_PASSWORD.length < 12 || VIEW_PASSWORD.length < 12 || ADMIN_PASSWORD === VIEW_PASSWORD) throw Error('密碼必須不同且各至少12字元');
+  const p = PropertiesService.getScriptProperties();
+  let id = p.getProperty(CFG.key);
+  if (!id) {
+    id = SpreadsheetApp.create('德州撲克帳本 v6').getId();
+    p.setProperty(CFG.key, id);
+  }
+  const salt = Utilities.getUuid();
+  p.setProperties({ V6_SALT: salt, V6_ADMIN: sha_(salt + ADMIN_PASSWORD), V6_VIEW: sha_(salt + VIEW_PASSWORD), V6_AUTH_VERSION: Utilities.getUuid() });
+  const book = SpreadsheetApp.openById(id);
+  let sh = book.getSheetByName(CFG.sheet) || book.insertSheet(CFG.sheet);
+  if (!sh.getRange('A1').getValue()) {
+    sh.getRange('A1:B2').setValues([['key', 'json'], ['ledger', JSON.stringify(empty_())]]);
+  }
+  console.log('帳本試算表：https://docs.google.com/spreadsheets/d/' + id + '/edit');
+}
+
+// 一次性清理舊版共用玩家密碼的雜湊值。新版本登入不再讀取 V7_PLAYER。
+function removeOldPlayerPassword() {
+  PropertiesService.getScriptProperties().deleteProperty('V7_PLAYER');
+  console.log('舊版共用玩家密碼已停用並清除；玩家請改用各場次六位數密碼。');
+}
+
+function sha_(value) {
+  return Utilities.computeDigest(Utilities.DigestAlgorithm.SHA_256, value, Utilities.Charset.UTF_8)
+    .map(x => ('0' + ((x + 256) % 256).toString(16)).slice(-2)).join('');
+}
+function doGet() { return HtmlService.createHtmlOutputFromFile('Index').setTitle('德州撲克帳本'); }
+function login(password) {
+  const p = PropertiesService.getScriptProperties();
+  if (!p.getProperty('V6_ADMIN')) throw Error('找不到原本的登入設定，請確認使用的是既有 Apps Script 專案');
+  const input = String(password == null ? '' : password).trim();
+  const hash = sha_(p.getProperty('V6_SALT') + input);
+  let role = hash === p.getProperty('V6_ADMIN') ? 'admin'
+    : hash === p.getProperty('V6_VIEW') ? 'viewer' : '';
+  let sessionId = '';
+
+  // 玩家不再使用共用密碼；六位數密碼只對應一個場次。
+  if (!role && /^\d{6}$/.test(input)) {
+    const db = read_();
+    const matched = db.sessions.find(s => String(s.playerCode || '') === input);
+    if (matched) { role = 'player'; sessionId = matched.id; }
+  }
+  if (!role) throw Error('密碼錯誤，或玩家場次密碼不存在');
+
+  const token = Utilities.getUuid() + Utilities.getUuid();
+  CacheService.getScriptCache().put('v6_' + token, JSON.stringify({ role, sessionId, version: p.getProperty('V6_AUTH_VERSION') }), CFG.sessionSeconds);
+  return { token, role };
+}
+function authInfo_(token) {
+  const text = CacheService.getScriptCache().get('v6_' + String(token));
+  if (!text) throw Error('登入已逾期，請重新登入');
+  const a = JSON.parse(text);
+  if (a.version !== PropertiesService.getScriptProperties().getProperty('V6_AUTH_VERSION')) throw Error('帳號授權已更新，請重新登入');
+  return a;
+}
+function auth_(token) { return authInfo_(token).role; }
+function logout(token) { CacheService.getScriptCache().remove('v6_' + String(token)); return true; }
+function empty_() { return { version: 6, sessions: [], logs: [] }; }
+function sheet_() {
+  const id = PropertiesService.getScriptProperties().getProperty(CFG.key);
+  if (!id) throw Error('請先執行 setup()');
+  return SpreadsheetApp.openById(id).getSheetByName(CFG.sheet);
+}
+// 舊版格式：A2=ledger、B2=完整 JSON。新版格式：A2=ledger:1、A3=ledger:2...
+// 每格最多放 30,000 個字元，避免整份帳本塞進單一儲存格。
+function read_() {
+  const sh = sheet_();
+  const lastRow = sh.getLastRow();
+  if (lastRow < 2) return empty_();
+  const values = sh.getRange(2, 1, lastRow - 1, 2).getValues();
+  const firstKey = String(values[0][0] || '');
+  if (firstKey === 'ledger') {
+    const raw = String(values[0][1] || '');
+    return raw ? JSON.parse(raw) : empty_();
+  }
+  if (firstKey === 'ledger:1') {
+    const parts = [];
+    for (let i = 0; i < values.length; i++) {
+      const expected = 'ledger:' + (i + 1);
+      if (String(values[i][0]) !== expected) break;
+      parts.push(String(values[i][1] || ''));
+    }
+    const json = parts.join('');
+    return json ? JSON.parse(json) : empty_();
+  }
+  throw Error('帳本資料格式異常，請勿手動修改資料工作表');
+}
+function splitJson_(json) {
+  const chunks = [];
+  const chunkSize = 30000;
+  for (let i = 0; i < json.length;) {
+    let end = Math.min(i + chunkSize, json.length);
+    // 避免切開 UTF-16 surrogate pair。
+    if (end < json.length) {
+      const code = json.charCodeAt(end - 1);
+      if (code >= 0xD800 && code <= 0xDBFF) end--;
+    }
+    chunks.push(json.slice(i, end));
+    i = end;
+  }
+  return chunks;
+}
+function write_(db) {
+  const sh = sheet_();
+  const chunks = splitJson_(JSON.stringify(db));
+  const output = chunks.map((chunk, index) => ['ledger:' + (index + 1), chunk]);
+  const requiredRows = output.length + 1;
+  if (sh.getMaxRows() < requiredRows) sh.insertRowsAfter(sh.getMaxRows(), requiredRows - sh.getMaxRows());
+  const lastRow = sh.getLastRow();
+  if (lastRow >= 2) sh.getRange(2, 1, lastRow - 1, 2).clearContent();
+  sh.getRange(2, 1, output.length, 2).setValues(output);
+}
+
+function newPlayerCode_(sessions) {
+  const used = new Set((sessions || []).map(s => String(s.playerCode || '')));
+  for (let i = 0; i < 100; i++) {
+    const hex = Utilities.getUuid().replace(/-/g, '').slice(0, 8);
+    const code = String(parseInt(hex, 16) % 1000000).padStart(6, '0');
+    if (!used.has(code)) return code;
+  }
+  throw Error('無法產生新的場次密碼，請再試一次');
+}
+function stamp_() { return Utilities.formatDate(new Date(), 'Asia/Taipei', 'yyyy-MM-dd HH:mm:ss'); }
+function uid_() { return Utilities.getUuid(); }
+function text_(v, max=500) {
+  const t = String(v == null ? '' : v).trim();
+  if (t.length > max) throw Error('文字長度超過上限');
+  return t;
+}
+function amount_(v, negative=false) {
+  const s = String(v).trim().replace(/,/g, '');
+  if (!(negative ? /^-?\d+$/ : /^\d+$/).test(s)) throw Error('金額必須是' + (negative ? '' : '非負') + '整數');
+  const n = Number(s);
+  if (!Number.isSafeInteger(n)) throw Error('金額超出安全範圍');
+  return n;
+}
+function date_(v) {
+  const s = String(v);
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(s)) throw Error('日期格式必須是 YYYY-MM-DD');
+  const [y,m,d] = s.split('-').map(Number);
+  const x = new Date(0);
+  x.setUTCFullYear(y,m-1,d);
+  if (x.getUTCFullYear() !== y || x.getUTCMonth() + 1 !== m || x.getUTCDate() !== d) throw Error('日期不正確');
+  return s;
+}
+function clock_(v) {
+  const s = String(v);
+  if (!/^([01]\d|2[0-3]):[0-5]\d$/.test(s)) throw Error('時間必須是 HH:MM');
+  return s;
+}
+function log_(db, sid, category, action, detail, pid='', pname='') {
+  db.logs.push({ id: uid_(), sid, category, action, detail, pid, pname, at: stamp_() });
+}
+function snapshot(token) {
+  const auth = authInfo_(token), role = auth.role;
+  let db = read_();
+
+  if (role === 'admin') {
+    // 舊場次若尚未有密碼，管理員第一次登入時自動補發。
+    const lock = LockService.getScriptLock();
+    lock.waitLock(30000);
+    try {
+      db = read_();
+      let changed = false;
+      db.sessions.forEach(s => {
+        if (!/^\d{6}$/.test(String(s.playerCode || ''))) {
+          s.playerCode = newPlayerCode_(db.sessions);
+          changed = true;
+        }
+      });
+      if (changed) write_(db);
+    } finally { lock.releaseLock(); }
+    return { role, data: db };
+  }
+
+  if (role === 'viewer') {
+    // 合夥人可讀全部帳務，但不回傳只供玩家登入的場次密碼。
+    const safe = { ...db, sessions: db.sessions.map(s => {
+      const { playerCode, ...session } = s;
+      return session;
+    }) };
+    return { role, data: safe };
+  }
+
+  if (role !== 'player') throw Error('無效的登入身分');
+  const session = db.sessions.find(s => s.id === auth.sessionId);
+  if (!session) throw Error('此場次不存在或玩家登入密碼已失效');
+
+  // 玩家只取得該密碼所屬場次的白名單資料。
+  // 不回傳其他場次、保險、水錢、合夥人、備註、Log、逐筆補碼或內部資訊。
+  const safe = {
+    version: db.version,
+    sessions: [{
+      id: session.id, date: session.date, start: session.start,
+      insurances: [],
+      players: (session.players || []).map(p => ({
+        id: p.id, name: p.name,
+        buyin: Number(p.buyin) + (p.rebuys || []).reduce((n, r) => n + Number(r.amount), 0),
+        cashout: p.cashout && p.cashout.amount != null ? { amount: Number(p.cashout.amount) } : null,
+        rebuys: []
+      }))
+    }],
+    logs: []
+  };
+  return { role, data: safe };
+}
+function backup(token) {
+  if (auth_(token) !== 'admin') throw Error('只有管理員可以匯出完整備份');
+  return JSON.stringify(read_(), null, 2);
+}
+
+// 支援 v6 備份匯入及舊版 Python v5 JSON 匯入。預設採「新增」，不覆寫現有場次。
+function importJson(token, raw) {
+  if (auth_(token) !== 'admin') throw Error('無匯入權限');
+  if (String(raw).length > 300000) throw Error('匯入檔過大');
+  const lock = LockService.getScriptLock();
+  lock.waitLock(30000);
+  try {
+    const incoming = JSON.parse(raw), base = read_();
+    const inputs = Array.isArray(incoming.sessions) ? incoming.sessions : null;
+    if (!inputs) throw Error('JSON 必須包含 sessions 陣列');
+    if (inputs.length > 200) throw Error('單次最多匯入 200 場');
+    let imported = 0;
+    inputs.forEach(old => {
+      const date = date_(old.date);
+      const start = clock_(old.start || old.start_time || '00:00');
+      const sid = uid_(), playerMap = {};
+      const s = { id:sid, playerCode:newPlayerCode_(base.sessions), date, start, note:text_(old.note), status:old.status === 'ended' || old.status === '已結束' ? 'ended' : 'open', endedAt:text_(old.endedAt || old.ended_at || ''), players:[], insurances:[], partners:[], rakes:[] };
+      (old.players || []).forEach(p => {
+        const rebuy = Array.isArray(p.rebuys) ? p.rebuys.map(x => ({ amount:amount_(x.amount), note:text_(x.note), at:text_(x.at || x.time || stamp_()) })) : [];
+        const co = p.cashout != null && typeof p.cashout === 'object' && p.cashout.amount != null ? { amount:amount_(p.cashout.amount), note:text_(p.cashout.note), at:text_(p.cashout.at || stamp_()) } : null;
+        const newPid = uid_();
+        if (p.id) playerMap[p.id] = newPid;
+        s.players.push({ id:newPid, name:text_(p.name,80), buyin:amount_(p.buyin), rebuys:rebuy, cashout:co, note:text_(p.note), createdAt:stamp_() });
+      });
+      (old.insurances || []).forEach(i => s.insurances.push({ id:uid_(), time:clock_(i.time), amount:amount_(i.amount,true), note:text_(i.note), at:text_(i.at || stamp_()) }));
+      const partnerMap = {};
+      (old.partners || []).forEach(p => {
+        const newId = uid_();
+        if (p.id) partnerMap[p.id] = newId;
+        s.partners.push({ id:newId, name:text_(p.name,80) });
+      });
+      (old.rakes || []).forEach(r => {
+        const splits = Array.isArray(r.splits) ? r.splits.map(x => ({ partnerId:partnerMap[String(x.partnerId)] || String(x.partnerId), name:text_(x.name,80), ratio:Number(x.ratio), amount:amount_(x.amount) })) : [];
+        s.rakes.push({ id:uid_(), time:clock_(r.time), amount:amount_(r.amount), note:text_(r.note), splits, at:text_(r.at || stamp_()) });
+      });
+      base.sessions.push(s);
+      if (incoming.version === 6 && Array.isArray(incoming.logs)) {
+        incoming.logs.filter(x => x.sid === old.id).forEach(x => base.logs.push({
+          id:uid_(), sid, category:text_(x.category,30), action:text_(x.action,80),
+          detail:text_(x.detail,2000), pid:playerMap[x.pid] || '', pname:text_(x.pname,80), at:text_(x.at,40)
+        }));
+      } else {
+        log_(base,sid,'場次','匯入場次','由 JSON 匯入；舊版歷史 Log 未自動轉換');
+      }
+      imported++;
+    });
+    write_(base);
+    return { imported };
+  } finally { lock.releaseLock(); }
+}
+
+function mutate(token, op, arg) {
+  if (auth_(token) !== 'admin') throw Error('只有管理員可以修改');
+  const lock = LockService.getScriptLock();
+  lock.waitLock(30000);
+  try {
+    const db = read_(), a = arg || {};
+    const findSession = (editable=true) => {
+      const s = db.sessions.find(x => x.id === a.sid);
+      if (!s) throw Error('找不到場次');
+      if (editable && s.status === 'ended') throw Error('場次已結束，不能修改');
+      return s;
+    };
+    const findPlayer = s => {
+      const p = s.players.find(x => x.id === a.pid);
+      if (!p) throw Error('請先選擇玩家');
+      if (p.cashout != null) throw Error('玩家已結碼，不能修改');
+      return p;
+    };
+    let s, p, item, desc, createdPlayerCode = '';
+    switch(op) {
+      case 'addSession':
+        s = { id:uid_(), playerCode:newPlayerCode_(db.sessions), date:date_(a.date), start:clock_(a.start), note:text_(a.note), status:'open', endedAt:'', players:[], insurances:[], partners:[], rakes:[] };
+        createdPlayerCode = s.playerCode;
+        db.sessions.push(s);
+        log_(db,s.id,'場次','新增場次',`${s.date} ${s.start} 備註：${s.note}`);
+        break;
+      case 'editSession':
+        s = findSession();
+        desc = `${s.date} ${s.start} ${s.note} → ${a.date} ${a.start} ${a.note}`;
+        Object.assign(s,{ date:date_(a.date), start:clock_(a.start), note:text_(a.note) });
+        log_(db,s.id,'場次','修改場次',desc);
+        break;
+      case 'deleteSession':
+        s = findSession(false);
+        db.sessions.splice(db.sessions.indexOf(s),1);
+        db.logs = db.logs.filter(x => x.sid !== s.id);
+        break;
+      case 'addPlayer':
+        s = findSession();
+        if (!text_(a.name,80)) throw Error('玩家姓名不可空白');
+        if (s.players.some(x => x.name.toLowerCase() === a.name.trim().toLowerCase())) throw Error('玩家姓名重複');
+        p = { id:uid_(), name:text_(a.name,80), buyin:amount_(a.buyin), rebuys:[], cashout:null, note:text_(a.note), createdAt:stamp_() };
+        s.players.push(p);
+        log_(db,s.id,'玩家','新增玩家',`買入 ${p.buyin}，備註：${p.note}`,p.id,p.name);
+        break;
+      case 'editPlayer':
+        s = findSession(); p = findPlayer(s);
+        if (!text_(a.name,80) || s.players.some(x => x.id !== p.id && x.name.toLowerCase() === a.name.trim().toLowerCase())) throw Error('姓名不可空白或重複');
+        desc = `${p.name} → ${a.name}`; p.name = text_(a.name,80);
+        log_(db,s.id,'玩家','編輯玩家',desc,p.id,p.name);
+        break;
+      case 'deletePlayer':
+        s = findSession(); p = findPlayer(s);
+        s.players.splice(s.players.indexOf(p),1);
+        log_(db,s.id,'玩家','刪除玩家',`刪除 ${p.name}；買入 ${p.buyin}；補碼 ${p.rebuys.reduce((n,x)=>n+x.amount,0)}`,p.id,p.name);
+        break;
+      case 'rebuy':
+        s = findSession(); p = findPlayer(s);
+        item = { amount:amount_(a.amount), note:text_(a.note), at:stamp_() };
+        if (item.amount <= 0) throw Error('補碼必須大於0');
+        p.rebuys.push(item);
+        log_(db,s.id,'玩家','快速補碼',`補碼 ${item.amount}，備註：${item.note}`,p.id,p.name);
+        break;
+      case 'cashout':
+        s = findSession(); p = findPlayer(s);
+        p.cashout = { amount:amount_(a.amount), note:text_(a.note), at:stamp_() };
+        log_(db,s.id,'玩家','結碼',`結碼 ${p.cashout.amount}；盈虧 ${p.cashout.amount-p.buyin-p.rebuys.reduce((n,x)=>n+x.amount,0)}；備註：${p.cashout.note}`,p.id,p.name);
+        break;
+      case 'addInsurance':
+      case 'editInsurance':
+        s = findSession();
+        item = op === 'editInsurance' ? s.insurances.find(x => x.id === a.itemId) : null;
+        if (op === 'editInsurance' && !item) throw Error('找不到保險紀錄');
+        desc = item ? `原：${item.time}/${item.amount}/${item.note}` : '';
+        if (!item) { item = { id:uid_() }; s.insurances.push(item); }
+        Object.assign(item,{ time:clock_(a.time), amount:amount_(a.amount,true), note:text_(a.note), at:item.at || stamp_(), modifiedAt:stamp_() });
+        log_(db,s.id,'保險',op==='addInsurance'?'新增保險':'編輯保險',`${desc} 新：${item.time}/${item.amount}/${item.note}`);
+        break;
+      case 'deleteInsurance':
+        s = findSession(); item = s.insurances.find(x => x.id === a.itemId);
+        if (!item) throw Error('找不到保險');
+        s.insurances.splice(s.insurances.indexOf(item),1);
+        log_(db,s.id,'保險','刪除保險',`${item.time}/${item.amount}/${item.note}`);
+        break;
+      case 'addPartner':
+        s = findSession();
+        if (!text_(a.name,80) || s.partners.some(x=>x.name.toLowerCase() === a.name.trim().toLowerCase())) throw Error('合夥人名稱不可空白或重複');
+        item = { id:uid_(), name:text_(a.name,80) };
+        s.partners.push(item);
+        log_(db,s.id,'合夥人','新增合夥人',item.name);
+        break;
+      case 'addRake':
+      case 'editRake':
+        s = findSession();
+        item = op === 'editRake' ? s.rakes.find(x=>x.id===a.itemId) : null;
+        if (op==='editRake' && !item) throw Error('找不到水錢紀錄');
+        const total = amount_(a.amount), splits = allocate_(total,a.ratios,s.partners);
+        desc = item ? `原：${item.time}/${item.amount}，分配：${JSON.stringify(item.splits)}，備註：${item.note}` : '';
+        if (!item) { item = { id:uid_() }; s.rakes.push(item); }
+        Object.assign(item,{ time:clock_(a.time), amount:total, splits, note:text_(a.note), at:item.at||stamp_(), modifiedAt:stamp_() });
+        log_(db,s.id,'水錢',op==='addRake'?'新增水錢':'編輯水錢',`${desc} 新：${item.time}/${total}，分配：${splits.map(x=>x.name+' '+x.ratio+'%='+x.amount).join('、')}，備註：${item.note}`);
+        break;
+      case 'endSession':
+        s = findSession();
+        s.status='ended'; s.endedAt=stamp_();
+        log_(db,s.id,'場次','結束場次',s.endedAt);
+        break;
+      default: throw Error('未知操作');
+    }
+    write_(db);
+    return { ok:true, playerCode:createdPlayerCode };
+  } finally { lock.releaseLock(); }
+}
+
+// 逐筆分配：比例總和必須為 100%，金額採最大餘數法，確保每筆分水加總等於水錢。
+function allocate_(total, ratios, partners) {
+  if (!partners.length) throw Error('請先新增合夥人');
+  if (!Array.isArray(ratios) || ratios.length !== partners.length) throw Error('請輸入所有合夥人的比例');
+  const input = new Map(ratios.map(x=>[String(x.partnerId),String(x.ratio)]));
+  const units = partners.map(p=>{
+    const str = input.get(p.id);
+    if (str == null || !/^\d+(\.\d{1,2})?$/.test(str)) throw Error('分水比例只能填 0～100，最多兩位小數');
+    const percent = Number(str);
+    if (percent > 100) throw Error('比例不可大於100%');
+    return { p, ratio:percent, bp:Math.round(percent*100) };
+  });
+  if (units.reduce((n,x)=>n+x.bp,0)!==10000) throw Error('每筆分水比例相加必須等於 100%');
+  const splits = units.map(x=>({ partnerId:x.p.id, name:x.p.name, ratio:x.ratio, amount:Math.floor(total*x.bp/10000), fraction:total*x.bp%10000 }));
+  let rem = total - splits.reduce((n,x)=>n+x.amount,0);
+  [...splits].sort((a,b)=>b.fraction-a.fraction).slice(0,rem).forEach(x=>x.amount++);
+  return splits.map(({fraction,...x})=>x);
+}
